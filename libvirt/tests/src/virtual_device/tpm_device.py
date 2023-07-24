@@ -6,6 +6,7 @@ import time
 import platform
 import shutil
 import glob
+#import subprocess
 
 from virttest import data_dir
 from virttest import libvirt_version
@@ -15,8 +16,8 @@ from virttest import utils_package
 from virttest import utils_misc
 from virttest import utils_libguestfs
 from virttest import utils_libvirtd
-from virttest import libvirt_version
 
+from virttest.libvirt_xml import domcapability_xml
 from virttest.libvirt_xml.devices.tpm import Tpm
 from virttest.libvirt_xml.vm_xml import VMXML
 from virttest.utils_test import libvirt
@@ -32,6 +33,40 @@ from avocado.utils import path as utils_path
 # Using as lower capital is not the best way to do, but this is just a
 # workaround to avoid changing the entire file.
 logging = log.getLogger('avocado.' + __name__)
+
+
+def get_supported_values(params):
+    """
+    Get supported vtpm attr values from qemu or swtpm.
+    :return: expected vtpm attr values
+    """
+    qemu_bin = utils_misc.get_qemu_binary(params)
+    out_m = process.run('%s -device help' % qemu_bin).stdout_text.strip()
+    tpm_mdls = re.findall('tpm-[a-z]+', out_m)
+    out_b = process.run("%s -tpmdev help" % qemu_bin, ignore_status=True).stderr_text.strip().split('\n')
+    del out_b[0]
+    tpm_bkds = []
+    for b in out_b:
+        b_list = b.split(' ')
+        tpm_bkds.append([bkd for bkd in b_list if bkd][0])
+    out_v = process.run('swtpm_setup --print-capabilities').stdout_text.strip()
+    tpm_v = re.findall('tpm-[1-9].[0-9]', out_v)
+    tpm_vsns = [v.removeprefix('tpm-') for v in tpm_v]
+    return tpm_mdls + tpm_bkds + tpm_vsns
+
+
+def check_domcaps(test, expect_values):
+    """
+    Check if vtpm attributes in domcapablities meet requirements.
+    :params test: test object
+    :params expect_values: expected vtpm attr values to check in domcapabilities.
+    """
+    domcapa_xml = domcapability_xml.DomCapabilityXML()
+    values = domcapa_xml.xmltreefile.findall("./devices/tpm/enum/value")
+    get_values = [v.text for v in values]
+    logging.debug('Got values: %s', get_values)
+    if set(get_values) != set(expect_values):
+        test.fail('Got vtpm values in domcapablities does not match expected')
 
 
 def run(test, params, env):
@@ -51,9 +86,11 @@ def run(test, params, env):
         test.cancel("Tpm device is not supported "
                     "on current qemu version.")
 
+    domcaps_check = ("yes" == params.get("domcaps_check", "no"))
     tpm_model = params.get("tpm_model")
     backend_type = params.get("backend_type")
     backend_version = params.get("backend_version")
+    backend_debug = params.get("backend_debug")
     device_path = params.get("device_path")
     tpm_num = int(params.get("tpm_num", 1))
     # After first start of vm with vtpm, do operations, check it still works
@@ -86,11 +123,13 @@ def run(test, params, env):
     remove_pcrbank = ('yes' == params.get("remove_pcrbank", "no"))
     pcrbank_change = params.get("pcrbank_change")
     test_rsaencypt = ('yes' == params.get("test_rsaencypt", "no"))
+    test_sign = ('yes' == params.get("test_sign", "no"))
     active_pcr_banks = params.get("active_pcr_banks")
     statedir = params.get("statedir")
     audit_cmd = params.get("audit_cmd")
     ausearch_check = params.get("ausearch_check")
     skip_start = ('yes' == params.get("skip_start", "no"))
+    #p2 = None
     swtpm_setup_path = params.get("swtpm_setup_path")
     swtpm_path = params.get("swtpm_path")
     source_attrs_str = params.get("source_attrs")
@@ -211,6 +250,14 @@ def run(test, params, env):
     vm_xml_backup = vm_xml.copy()
     host_arch = platform.machine()
 
+    if domcaps_check:
+        expect_values = get_supported_values(params)
+        if libvirt_version.version_compare(9, 0, 0):
+            expect_values.append('external')
+        logging.debug('Expected vtpm values: %s', expect_values)
+        check_domcaps(test, expect_values)
+        return
+
     # Only check_pcrbanks for new version
     if not libvirt_version.version_compare(7, 10, 0) or not compare_swtpm_version(0, 7):
         check_pcrbanks = False
@@ -283,6 +330,8 @@ def run(test, params, env):
         if backend_version:
             check_ver = backend_version if backend_version not in ["none", "default"] else '2.0'
             xpaths.append({'element_attrs': [".//backend[@version='%s']" % check_ver]})
+        if backend_debug:
+            xpaths.append({'element_attrs': [".//backend[@debug='%s']" % backend_debug]})
         if active_pcr_banks and not remove_pcrbank:
             check_active_pcr_banks(xml_after_adding_device)
         if backend_type == "passthrough":
@@ -302,7 +351,7 @@ def run(test, params, env):
 
     def launch_external_swtpm(skip_setup):
         """
-        Launch externally swtpm
+        Launch external swtpm
 
         :param skip_setup: whether skip swtpm_setup steps
         """
@@ -310,20 +359,32 @@ def run(test, params, env):
             if os.path.exists(statedir):
                 shutil.rmtree(statedir)
             os.mkdir(statedir)
-            process.run('chcon -t virtd_exec_t %s' % swtpm_setup_path, ignore_status=False, shell=True)
+            process.run("ls -lZd %s" % statedir)
+            #cmd1 = "swtpm_setup --tpm2 --tpmstate %s --create-ek-cert --create-platform-cert --overwrite" % statedir
+        #cmd2 = "swtpm socket --ctrl type=unixio,path=%s,mode=0600 --tpmstate dir=%s,mode=0600 --tpm2 --terminate" % (source_socket, statedir)
+            process.run("chcon -t virtd_exec_t %s" % swtpm_setup_path, ignore_status=False, shell=True)
             cmd1 = "systemd-run %s --tpm2 --tpmstate %s --create-ek-cert --create-platform-cert --overwrite" % (swtpm_setup_path, statedir)
-            process.run('chcon -t virtd_exec_t %s' % swtpm_path, ignore_status=False, shell=True)
+            process.run("chcon -t virtd_exec_t %s" % swtpm_path, ignore_status=False, shell=True)
         cmd2 = "systemd-run %s socket --ctrl type=unixio,path=%s,mode=0600 --tpmstate dir=%s,mode=0600 --tpm2 --terminate" % (swtpm_path, source_socket, statedir)
         try:
             if not skip_setup:
                 process.run(cmd1, ignore_status=False, shell=True)
+            #logging.debug("Running '%s'", cmd2)
+            #p2 = subprocess.Popen(cmd2, shell=True, stdout=subprocess.PIPE,
+            #                      stderr=subprocess.PIPE)
+            #process.run("ps aux|grep 'swtpm socket'|grep -v avocado-runner-avocado-vt|grep -v grep", ignore_status=True, shell=True)
+            #if p2.poll() is not None:
+            #    test.error('External swtpm socket process does not exist')
             process.run(cmd2, ignore_status=False, shell=True)
             # Make sure the socket is created
-            utils_misc.wait_for(lambda: os.path.isdir(source_socket), timeout=3)
-            process.run('chcon -t svirt_image_t %s' % source_socket, ignore_status=False, shell=True)
-            process.run('chown qemu:qemu %s' % source_socket, ignore_status=False, shell=True)
+            utils_misc.wait_for(lambda: os.path.exists(source_socket), timeout=3)
+            #process.run('chcon -t svirt_image_t %s' % source_socket, ignore_status=False, shell=True)
+            #process.run('chown qemu:qemu %s' % source_socket, ignore_status=False, shell=True)
+            process.run("chcon -t svirt_image_t %s" % source_socket, ignore_status=False, shell=True)
+            process.run("chown qemu:qemu %s" % source_socket, ignore_status=False, shell=True)
         except Exception as err:
-            process.run("pkill swtpm", shell=True)
+            #process.run("pkill swtpm", shell=True)
+            process.run("pkill swtpm", shell=True, ignore_status=False)
             test.error("{}".format(err))
 
     def check_qemu_cmd_line(vm, vm_name, domid):
@@ -396,19 +457,25 @@ def run(test, params, env):
             pattern_list.remove("--log")
         if prepare_secret:
             pattern_list.extend(["--key", "--migration-key"])
+        if backend_debug:
+            pattern_list.extend(["level=%s" % backend_debug])
         for pattern in pattern_list:
             if not re.search(pattern, cmdline):
                 test.fail("Can not find the %s for tpm device "
                           "in swtpm cmd line." % pattern)
         # Check swtpm files
+        statedir = params.get("statedir", "")
         if backend_type == 'emulator':
             file_list = ["/var/run/libvirt/qemu/swtpm/%s-%s-swtpm.sock" % (domid, vm_name)]
-            file_list.append("/var/lib/libvirt/swtpm/%s/tpm2" % domuuid)
+            statedir = "/var/lib/libvirt/swtpm/%s/tpm2" % domuuid
+            file_list.append(statedir)
             file_list.append("/var/log/swtpm/libvirt/qemu/%s-swtpm.log" % vm_name)
             file_list.append("/var/run/libvirt/qemu/swtpm/%s-%s-swtpm.pid" % (domid, vm_name))
             for swtpm_file in file_list:
                 if not os.path.exists(swtpm_file):
                     test.fail("Swtpm file: %s does not exist" % swtpm_file)
+        process.run("ls -lZd %s" % statedir)
+        process.run("ls -lZ %s/tpm2-00.permall" % statedir)
         logging.info("------PASS on Swtpm cmdline and files check------")
 
     def get_tpm2_tools_cmd(session=None):
@@ -567,6 +634,8 @@ def run(test, params, env):
         # Download test suite
         if tpm_testsuite_url.count("EXAMPLE"):
             test.error("Please provide the URL %s" % tpm_testsuite_url)
+        if not utils_package.package_install('wget', session, 60):
+            test.fail("Failed to install wget in guest OS.")
         download_cmd = "wget %s -O %s" % (tpm_testsuite_url, "/root/linux.tar.xz")
         output = session.cmd_output(download_cmd, timeout=480)
         logging.debug("Command output: %s", output)
@@ -601,19 +670,28 @@ def run(test, params, env):
                     test.fail("test suite check failed.")
         logging.info("------PASS on kernel test suite check------")
 
+    def prepare_rsa_key(session, test_msg="my message"):
+        """
+        Create RSA key and load it, also prepare data file.
+
+        :param session: Guest session to be tested
+        :param test_msg: message to put in data file
+        """
+        if not utils_package.package_install(["tpm2-tools"], session, 360):
+            test.error("Failed to install tpm2-tools package in guest")
+        session.cmd_status_output("tpm2_createprimary -C e -c primary.ctx")
+        session.cmd("tpm2_create -C primary.ctx -G rsa2048 -u key.pub -r key.priv")
+        session.cmd("tpm2_load -C primary.ctx -u key.pub -r key.priv -c key.ctx")
+        session.cmd("echo %s > msg.dat" % test_msg)
+
     def test_rsaencypt_in_guest(session):
         """
         Test tpm RSA encryption in guest.
 
         :param session: Guest session to be tested
         """
-        if not utils_package.package_install(["tpm2-tools"], session, 360):
-            test.error("Failed to install tpm2-tools package in guest")
-        session.cmd_status_output("tpm2_createprimary -c primary.ctx")
-        session.cmd("tpm2_create -C primary.ctx -Grsa2048 -u key.pub -r key.priv")
-        session.cmd("tpm2_load -C primary.ctx -u key.pub -r key.priv -c key.ctx")
-        test_msg = 'my message'
-        session.cmd("echo %s > msg.dat" % test_msg)
+        test_msg = 'my encrypt decrypt test message'
+        prepare_rsa_key(session, test_msg)
         for padding_scheme in ['oaep', 'rsaes', 'null']:
             status, output = session.cmd_status_output("tpm2_rsaencrypt -c key.ctx -o msg.enc -s %s msg.dat" % padding_scheme)
             if status:
@@ -628,6 +706,19 @@ def run(test, params, env):
             session.cmd("rm -f msg.enc msg.ptext")
         session.cmd("rm -f primary.ctx key.pub key.priv key.ctx msg.dat")
 
+    def test_sign_in_guest(session):
+        """
+        Test tpm signature in guest.
+
+        :param session: Guest session to be tested
+        """
+        prepare_rsa_key(session)
+        for hash_algorithm in ['sha1', 'sha256', 'sha384', 'sha512']:
+            status, output = session.cmd_status_output("tpm2_sign -c key.ctx -g %s -o sig.rssa msg.dat" % hash_algorithm)
+            if status:
+                test.fail("tpm2_sign failed with %s hash algorithm: %s" % (hash_algorithm, output))
+        session.cmd("rm -f primary.ctx key.pub key.priv key.ctx msg.dat sig.rssa")
+
     def persistent_test(vm, vm_xml):
         """
         Test vtpm with persistent_state for transient vm.
@@ -636,7 +727,7 @@ def run(test, params, env):
         virsh.create(vm_xml.xml, **virsh_dargs)
         domuuid = vm.get_uuid()
         state_file = "/var/lib/libvirt/swtpm/%s/tpm2/tpm2-00.permall" % domuuid
-        process.run("ls -Z %s" % state_file)
+        process.run("ls -lZ %s" % state_file)
         session = vm.wait_for_login()
         test_guest_tpm("2.0", session, False)
         session.close()
@@ -644,7 +735,7 @@ def run(test, params, env):
         vm.destroy()
         if not os.path.exists(state_file):
             test.fail("Swtpm state file: %s does not exist after destroy vm'" % state_file)
-        process.run("ls -Z %s" % state_file)
+        process.run("ls -lZ %s" % state_file)
 
     def test_undefine_tpmstate(vm):
         """
@@ -719,6 +810,20 @@ def run(test, params, env):
         if swtpm_pidfile and libvirt_version.version_compare(8, 7, 0):
             test.error('swtpm.pid still exists after %s: %s' % (test_stage, swtpm_pidfile))
 
+    def test_swtpm_logging():
+        """
+        test logging level for swtpm when backend_debug is set
+        """
+        log_pattern_list = ["SWTPM_IO_Read",  "SWTPM_IO_Write"]
+        swtpm_log = "/var/log/swtpm/libvirt/qemu/" + vm.name + "-swtpm.log"
+        with open(swtpm_log) as f:
+            lines = "".join(f.readlines())
+            for log_pattern in log_pattern_list:
+                if re.search(log_pattern, lines):
+                    logging.info("Finding msg<%s> in swtpm log", log_pattern)
+                else:
+                    test.fail("Can not find msg:<%s> in swtpm log" % log_pattern)
+
     try:
         tpm_real_v = None
         sec_uuids = []
@@ -746,6 +851,8 @@ def run(test, params, env):
                 if backend_type == "emulator":
                     if backend_version != 'none':
                         backend.backend_version = backend_version
+                    if backend_debug:
+                        backend.backend_debug = backend_debug
                     if persistent_state:
                         backend.persistent_state = "yes"
                     if prepare_secret:
@@ -800,18 +907,27 @@ def run(test, params, env):
             return
         if tpm_model and backend_version != 'default':
             expect_fail = False
+            if ausearch_check:
+                cmd = "truncate -s 0  /var/log/audit/audit.log*"
+                process.run(cmd, shell=True)
+                ausearch_ret = process.run(audit_cmd, verbose=True, shell=True, ignore_status=True)
+                if not ausearch_ret:
+                    test.fail('audit log is not cleaned well.')
+            if backend_type == "external":
+                process.run("ps auxZ|grep 'swtpm socket'|grep -v avocado-runner-avocado-vt|grep -v grep", ignore_status=True, shell=True)
+                process.run("ls -hZ %s" % source_socket, verbose=True, shell=True, ignore_status=True)
             try:
                 vm.start()
             except VMStartError as detail:
-                if secret_value == 'none' or secret_uuid == 'nonexist' or not source_socket:
+                if secret_value == 'none' or secret_uuid == 'nonexist' or (source_attrs_str and not source_socket):
                     logging.debug("Expected failure: %s", detail)
                     return
                 else:
+                    pattern = "Check error log .*%s-swtpm.log. for details" % vm_name
+                    if re.search(pattern, str(detail)):
+                        logging.debug("Printing swtpm.log:")
+                        process.run('cat /var/log/swtpm/libvirt/qemu/%s-swtpm.log' % vm_name)
                     test.fail(detail)
-            if ausearch_check:
-                process.run("echo > /var/log/audit/audit.log", ignore_status=True)
-                ausearch_result = process.run(audit_cmd, verbose=True, shell=True)
-                libvirt.check_result(ausearch_result, expected_match=ausearch_check)
             if undefine_flag:
                 time.sleep(5)
                 vm.destroy()
@@ -916,6 +1032,9 @@ def run(test, params, env):
                         return
             domid = vm.get_id()
             check_qemu_cmd_line(vm, vm_name, domid)
+            if ausearch_check:
+                ausearch_result = process.run(audit_cmd, verbose=True, shell=True)
+                libvirt.check_result(ausearch_result, expected_match=ausearch_check)
             if backend_type == "passthrough":
                 if tpm_real_v == "1.2" and tpm_model == "tpm-crb":
                     expect_fail = True
@@ -932,9 +1051,13 @@ def run(test, params, env):
                 run_test_suite_in_guest(session)
             elif test_rsaencypt:
                 test_rsaencypt_in_guest(session)
+            elif test_sign:
+                test_sign_in_guest(session)
             else:
                 test_guest_tpm(expect_version, session, expect_fail)
             session.close()
+            if backend_debug:
+                test_swtpm_logging()
             if multi_vms:
                 reuse_by_vm2(tpm_dev)
                 if backend_type != "passthrough":
@@ -981,6 +1104,12 @@ def run(test, params, env):
             process.run("restorecon %s" % swtpm_path, ignore_status=False, shell=True)
             if os.path.exists(statedir):
                 shutil.rmtree(statedir)
+            #if p2 and p2.poll() is None:
+            #    p2.kill()
+            #process.run("rm -rf /var/lib/swtpm-localca/{,.}*", shell=True, ignore_status=True)
+            if os.path.exists(source_socket):
+                os.remove(source_socket)
+            process.run("rm -f /var/lib/swtpm-localca/*", shell=True, ignore_status=True)
         # Remove swtpm log file in case of impact on later runs
         if os.path.exists("/var/log/swtpm/libvirt/qemu/%s-swtpm.log" % vm.name):
             os.remove("/var/log/swtpm/libvirt/qemu/%s-swtpm.log" % vm.name)
